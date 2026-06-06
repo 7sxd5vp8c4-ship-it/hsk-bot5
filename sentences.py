@@ -1,1190 +1,172 @@
-import os, json, random, asyncio, logging
-from datetime import datetime, timedelta, time as dtime
-from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-
-from vocabulary import HSK_WORDS as _BASE_WORDS
-from radicals import RADICALS
-from sentences import SENTENCES, GRAMMAR_POINTS
-
-# Combined pool: built-in HSK words + tutor-added custom words.
-# Everything (task building, clusters, reviews) reads from HSK_WORDS,
-# so appending custom words here makes them behave exactly like HSK words.
-HSK_WORDS = list(_BASE_WORDS)
-
-def load_custom_words():
-    """Load tutor-added words from disk and merge into the pool (no duplicates)."""
-    if not CUSTOM_FILE.exists():
-        return
-    try:
-        with open(CUSTOM_FILE) as f:
-            custom = json.load(f)
-    except Exception:
-        return
-    existing = {w["id"] for w in HSK_WORDS}
-    for w in custom:
-        if w["id"] not in existing:
-            HSK_WORDS.append(w)
-            existing.add(w["id"])
-
-def append_custom_word(word):
-    """Persist one new tutor word to disk and add it to the live pool."""
-    custom = []
-    if CUSTOM_FILE.exists():
-        try:
-            with open(CUSTOM_FILE) as f:
-                custom = json.load(f)
-        except Exception:
-            custom = []
-    custom.append(word)
-    with open(CUSTOM_FILE, "w") as f:
-        json.dump(custom, f, ensure_ascii=False, indent=2)
-    HSK_WORDS.append(word)
-
-def next_custom_id():
-    """Generate a unique id like 'c_001' for a new tutor word."""
-    n = sum(1 for w in HSK_WORDS if w["id"].startswith("c_")) + 1
-    while any(w["id"] == f"c_{n:03d}" for w in HSK_WORDS):
-        n += 1
-    return f"c_{n:03d}"
-
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN      = os.environ["BOT_TOKEN"]
-DATA_FILE      = Path("user_data.json")
-CUSTOM_FILE    = Path("custom_words.json")  # tutor-added words, survives user_data resets
-DEFAULT_NEW    = 12
-RADICAL_DAILY  = 3
-RADICAL_PHASE  = 3
-MIN_RETENTION  = 0.85
-MAX_RETENTION  = 0.92
-SM2_EASE_INIT  = 2.5
-SM2_EASE_MIN   = 1.3
-WEAK_THRESHOLD = 3
-EVENING_HOUR   = 15  # 15:00 UTC = 22:00 (10 PM) Thailand time (UTC+7)
-MORNING_HOUR   = 8   # default study reminder
-GRAMMAR_CYCLE  = 3   # introduce a new grammar point every N days
-
-ROUND_ANGLES = {
-    1: ["recognition"],
-    2: ["mcq_meaning", "pinyin_input"],
-    3: ["production", "mcq_char"],
-}
-
-
-# ── PERSISTENCE ───────────────────────────────────────────────────────────────
-
-def load_data():
-    if DATA_FILE.exists():
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    return {}
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_user(data, uid):
-    k = str(uid)
-    if k not in data:
-        data[k] = {
-            "vocab_cards": {}, "radical_cards": {},
-            "vocab_seen": [], "radical_seen": [],
-            "streak": 0, "last_date": None, "session_date": None,
-            "new_today": 0, "rad_new_today": 0,
-            "correct_today": 0, "total_today": 0, "errors_today": 0,
-            "daily_new": DEFAULT_NEW,
-            "push_hour": MORNING_HOUR,
-            "evening_hour": EVENING_HOUR,
-            "paused": False,
-            "current_task": None,
-            "queue": [], "q_idx": 0,
-            "today_ids": [], "today_rad_ids": [],
-            "week_ids": [],
-            "round_num": 0, "round_queue": [], "round_idx": 0,
-            "in_round": False,
-            "error_counts": {},
-            "tomorrow_radical_id": None,
-            "grammar_seen": [],
-            "grammar_day": 0,
-            "week_grammar": [],
-            "last_grammar_date": None,
-        }
-    else:
-        u = data[k]
-        # One-time migration: bump the OLD evening default (13 UTC = 20:00 Thai)
-        # to the new default (15 UTC = 22:00 Thai). Only touches users still on
-        # the old default; anyone who set a custom time with /seteveningtime keeps it.
-        if u.get("evening_hour") in (13, 20) and not u.get("_evening_migrated"):
-            u["evening_hour"] = EVENING_HOUR
-            u["_evening_migrated"] = True
-    return data[k]
-
-
-# ── SM-2 ──────────────────────────────────────────────────────────────────────
-
-def sm2_update(card, quality):
-    ease = card.get("ease", SM2_EASE_INIT)
-    interval = card.get("interval", 0)
-    reps = card.get("reps", 0)
-    if quality >= 3:
-        interval = 1 if reps == 0 else (3 if reps == 1 else round(interval * ease))
-        if quality == 4:
-            interval = round(interval * 1.3)
-        reps += 1
-    else:
-        reps, interval = 0, 1
-    ease = max(SM2_EASE_MIN, ease + 0.1 - (4-quality)*(0.08+(4-quality)*0.02))
-    due = (datetime.utcnow() + timedelta(days=interval)).date().isoformat()
-    return {**card, "ease": round(ease,3), "interval": interval, "reps": reps, "due": due}
-
-def due_ids(cards):
-    today = datetime.utcnow().date().isoformat()
-    return [wid for wid, c in cards.items() if c.get("due","0000-00-00") <= today]
-
-def introduce_items(seen, cards, pool, n):
-    seen_set = set(seen)
-    chosen = [x for x in pool if x["id"] not in seen_set][:n]
-    today = datetime.utcnow().date().isoformat()
-    for x in chosen:
-        seen.append(x["id"])
-        cards[x["id"]] = {"ease": SM2_EASE_INIT, "interval": 0, "reps": 0, "due": today}
-    return [x["id"] for x in chosen]
-
-
-# ── RADICAL CLUSTER SYSTEM ────────────────────────────────────────────────────
-
-def get_radical_cluster(radical_id):
-    rad = next((r for r in RADICALS if r["id"] == radical_id), None)
-    if not rad:
-        return rad, []
-    words = [w for w in HSK_WORDS if w.get("radical_id") == radical_id]
-    return rad, words
-
-def pick_next_radical(user):
-    seen_rads = set(user["radical_seen"])
-    for r in RADICALS:
-        if r["id"] not in seen_rads:
-            return r["id"]
-    return RADICALS[0]["id"]
-
-def format_evening_preview(radical_id):
-    rad, words = get_radical_cluster(radical_id)
-    if not rad:
-        return "No radical data found."
-
-    lines = [
-        f"Tonight's radical: {rad['radical']} ({rad['full']})",
-        f"Pinyin: {rad['pinyin']}",
-        f"Meaning: {rad['meaning_en']} / {rad['meaning_ru']}",
-        f"Example word: {rad['example']} ({rad['ex_pinyin']}) — {rad['ex_en']}",
-        "",
-        "Write these in your notebook tonight:",
-        "",
-    ]
-
-    # Collect phonetic families
-    phonetic_groups = {}
-    for w in words:
-        ph = w.get("phonetic")
-        if ph:
-            phonetic_groups.setdefault(ph, []).append(w)
-
-    for w in words:
-        homophones = w.get("homophones", [])
-        synonyms = w.get("synonyms", [])
-        notes = w.get("notes", "")
-
-        line = f"{w['char']}  {w['pinyin']}  —  {w['meaning_en']} / {w['meaning_ru']}"
-        lines.append(line)
-
-        if homophones:
-            hp_str = ", ".join(f"{h['char']} ({h['pinyin']}) = {h['meaning_en']}" for h in homophones)
-            lines.append(f"   Sounds like: {hp_str}")
-
-        if synonyms:
-            sy_str = ", ".join(f"{s['char']} {s['pinyin']} = {s['meaning_en']}" for s in synonyms)
-            lines.append(f"   Similar meaning: {sy_str}")
-
-        if notes:
-            lines.append(f"   Note: {notes}")
-
-        lines.append("")
-
-    # Phonetic family note
-    if phonetic_groups:
-        lines.append("Phonetic families (same sound component):")
-        for ph, group in phonetic_groups.items():
-            chars = " / ".join(f"{w['char']}({w['pinyin']})" for w in group)
-            lines.append(f"   {ph}: {chars}")
-        lines.append("")
-
-    lines.append("Good night! Practice starts tomorrow morning.")
-    return "\n".join(lines)
-
-
-# ── WEEKLY TEST ───────────────────────────────────────────────────────────────
-
-def build_weekly_test_queue(user):
-    week_ids = user.get("week_ids", [])
-    hard_types = ["production", "pinyin_input", "fill_blank"]
-    queue = []
-    ids = list(week_ids)
-    random.shuffle(ids)
-    for wid in ids:
-        if wid in user["vocab_cards"]:
-            queue.append({"kind": "vocab", "id": wid, "forced_type": random.choice(hard_types)})
-    # Append this week's grammar points as fill-in-the-blank items
-    for gid in user.get("week_grammar", []):
-        queue.append({"kind": "grammar", "id": gid, "forced_type": None})
-    return queue
-
-def build_grammar_task(point_id, user, forced_type=None):
-    """A fill-in-the-blank drawn from a grammar point's example sentences."""
-    point = next((g for g in GRAMMAR_POINTS if g["id"] == point_id), None)
-    candidates = grammar_examples_for(point_id)
-    if not point or not candidates:
-        return {}
-    s = random.choice(candidates)
-    sentence = s["sentence"]
-    # Blank out the keyword that signals this grammar point, if present;
-    # otherwise blank a content word so the learner reconstructs the pattern.
-    keyword_map = {
-        "ba_disposal": "把", "bei_passive": "被", "zhe_continuous": "着",
-        "le_completed": "了", "zai_progressive": "在", "bi_comparison": "比",
-        "guo_experiential": "过", "de_complement": "得", "de_possessive": "的",
-        "shi_to_be": "是", "you_have": "有", "hen_adj": "很", "bu_negation": "不",
-        "ma_question": "吗", "gei_give": "给", "cong_from": "从",
-        "weile_purpose": "为了", "ruguo_if": "如果",
-    }
-    kw = keyword_map.get(point_id)
-    if kw and kw in sentence:
-        blanked = sentence.replace(kw, "___", 1)
-        answer = kw
-    else:
-        # fall back: blank the whole pattern is too hard; blank first 2-char word
-        answer = kw or sentence[0]
-        blanked = sentence.replace(answer, "___", 1)
-    return {
-        "type": "grammar_blank", "word_id": point_id, "is_grammar": True,
-        "prompt": (f"Grammar: {point['title']}\n\n"
-                   f"Fill in the blank:\n<b>{blanked}</b>\n({s['translation']})\n\n"
-                   f"Type the missing part:"),
-        "answer": answer, "alt_answers": [],
-        "reveal": f"{sentence}\n({s['translation']})\nPoint: {point['title']}",
-    }
-
-
-
-# ── WEAK CARDS ────────────────────────────────────────────────────────────────
-
-def get_weak_ids(user):
-    ec = user.get("error_counts", {})
-    return [wid for wid, cnt in ec.items() if cnt >= WEAK_THRESHOLD and wid in user["vocab_cards"]]
-
-
-# ── ROUND QUEUE ───────────────────────────────────────────────────────────────
-
-def build_round_queue(user):
-    rn = user["round_num"]
-    today_ids = list(user["today_ids"])
-    weak_ids = [w for w in get_weak_ids(user) if w not in today_ids]
-    rad_ids = list(user["today_rad_ids"])
-    all_vocab = today_ids + weak_ids
-    random.shuffle(all_vocab)
-    task_pool = ROUND_ANGLES.get(rn, ["recognition","mcq_meaning","pinyin_input","production","fill_blank","mcq_char"])
-    queue = []
-    for wid in all_vocab:
-        queue.append({"kind":"vocab","id":wid,"forced_type":random.choice(task_pool)})
-    if rn <= 2:
-        for rid in rad_ids:
-            queue.append({"kind":"radical","id":rid,"forced_type":None})
-        random.shuffle(queue)
-    return queue
-
-
-# ── TASK BUILDERS ─────────────────────────────────────────────────────────────
-
-def pick_vocab_task(card):
-    reps = card.get("reps", 0)
-    if reps == 0: return "recognition"
-    if reps <= 2: return random.choice(["recognition","mcq_meaning","fill_blank"])
-    if reps <= 5: return random.choice(["mcq_meaning","pinyin_input","fill_blank","production"])
-    return random.choice(["pinyin_input","production","fill_blank","mcq_char"])
-
-def pick_radical_task(card):
-    reps = card.get("reps", 0)
-    if reps == 0: return "rad_recognition"
-    if reps <= 3: return random.choice(["rad_recognition","rad_mcq_meaning"])
-    return random.choice(["rad_mcq_meaning","rad_mcq_char","rad_pinyin"])
-
-def mcq_options(item, pool, field):
-    others = [x for x in pool if x["id"] != item["id"]]
-    opts = [item] + random.sample(others, min(3, len(others)))
-    random.shuffle(opts)
-    ci = next(i for i, x in enumerate(opts) if x["id"] == item["id"])
-    return [x[field] for x in opts], ci
-
-def both_meanings(word):
-    """English / Russian, but skip the slash when Russian is empty (custom words)."""
-    ru = word.get("meaning_ru", "")
-    return f"{word['meaning_en']} / {ru}" if ru else word["meaning_en"]
-
-def build_vocab_task(word_id, user, forced_type=None):
-    word = next((w for w in HSK_WORDS if w["id"] == word_id), None)
-    if not word: return {}
-    card = user["vocab_cards"].get(word_id, {})
-    t = forced_type or pick_vocab_task(card)
-
-    # Fix #2: no pinyin shown in production tasks
-    if t == "recognition":
-        ru = word.get("meaning_ru", "")
-        alts = word.get("alt_en", []) + ([ru] if ru else [])
-        return {"type":t,"word_id":word_id,
-            "prompt":f"<b>{word['char']}</b>  [{word['pinyin']}]\n\nWhat does this mean?\nType in English or Russian",
-            "answer":word["meaning_en"],"alt_answers":alts,
-            "reveal":f"{word['char']} [{word['pinyin']}] - {both_meanings(word)}"}
-
-    if t == "mcq_meaning":
-        opts, ci = mcq_options(word, HSK_WORDS, "meaning_en")
-        return {"type":t,"word_id":word_id,
-            "prompt":f"<b>{word['char']}</b>  [{word['pinyin']}]\n\nChoose the correct meaning:",
-            "options":opts,"correct_idx":ci,
-            "reveal":f"{word['char']} [{word['pinyin']}] - {word['meaning_en']}"}
-
-    if t == "mcq_char":
-        opts, ci = mcq_options(word, HSK_WORDS, "char")
-        return {"type":t,"word_id":word_id,
-            "prompt":f"<b>{word['meaning_en']}</b>  [{word['pinyin']}]\n\nChoose the correct character:",
-            "options":opts,"correct_idx":ci,
-            "reveal":f"{word['char']} [{word['pinyin']}] - {word['meaning_en']}"}
-
-    if t == "pinyin_input":
-        return {"type":t,"word_id":word_id,
-            "prompt":f"<b>{word['char']}</b>  -  {word['meaning_en']}\n\nType the pinyin with tones:",
-            "answer":word["pinyin"],
-            "reveal":f"Pinyin: {word['pinyin']}"}
-
-    if t == "production":
-        # No pinyin shown - Fix #2
-        return {"type":t,"word_id":word_id,
-            "prompt":f"<b>{word['meaning_en']}</b>\n\nType the Chinese character(s):",
-            "answer":word["char"],
-            "reveal":f"{word['char']} [{word['pinyin']}] - {word['meaning_en']}"}
-
-    if t == "fill_blank":
-        candidates = [s for s in SENTENCES if word["char"] in s["sentence"]]
-        if candidates:
-            s = random.choice(candidates)
-            blank = s["sentence"].replace(word["char"],"___",1)
-            return {"type":t,"word_id":word_id,
-                "prompt":f"Fill in the blank:\n\n<b>{blank}</b>\n({s['translation']})\n\nType the missing word:",
-                "answer":word["char"],"alt_answers":[],
-                "reveal":f"Answer: {word['char']} [{word['pinyin']}] - {word['meaning_en']}"}
-        # Fallback: no pinyin shown either
-        return {"type":t,"word_id":word_id,
-            "prompt":f"Fill in the blank:\n\n<b>___</b> means <b>{word['meaning_en']}</b>\n\nType the character(s):",
-            "answer":word["char"],"alt_answers":[],
-            "reveal":f"Answer: {word['char']} [{word['pinyin']}] - {word['meaning_en']}"}
-    return {}
-
-def build_radical_task(rad_id, user, forced_type=None):
-    rad = next((r for r in RADICALS if r["id"] == rad_id), None)
-    if not rad: return {}
-    card = user["radical_cards"].get(rad_id, {})
-    t = forced_type or pick_radical_task(card)
-
-    if t == "rad_recognition":
-        return {"type":t,"word_id":rad_id,"is_radical":True,
-            "prompt":f"Radical\n\n<b>{rad['radical']}</b>  (full: {rad['full']})\n\nWhat does this mean?\nType in English or Russian",
-            "answer":rad["meaning_en"],"alt_answers":[rad["meaning_ru"]],
-            "reveal":f"{rad['radical']} [{rad['pinyin']}] - {rad['meaning_en']} / {rad['meaning_ru']}\nExample: {rad['example']} ({rad['ex_pinyin']}) - {rad['ex_en']}"}
-
-    if t == "rad_mcq_meaning":
-        opts, ci = mcq_options(rad, RADICALS, "meaning_en")
-        return {"type":t,"word_id":rad_id,"is_radical":True,
-            "prompt":f"Radical\n\n<b>{rad['radical']}</b>  [{rad['pinyin']}]\n\nChoose the correct meaning:",
-            "options":opts,"correct_idx":ci,
-            "reveal":f"{rad['radical']} - {rad['meaning_en']}\nExample: {rad['example']} - {rad['ex_en']}"}
-
-    if t == "rad_mcq_char":
-        opts, ci = mcq_options(rad, RADICALS, "radical")
-        return {"type":t,"word_id":rad_id,"is_radical":True,
-            "prompt":f"Radical\n\nWhich radical means <b>{rad['meaning_en']}</b>?\n[{rad['pinyin']}]",
-            "options":opts,"correct_idx":ci,
-            "reveal":f"{rad['radical']} [{rad['pinyin']}] - {rad['meaning_en']}"}
-
-    if t == "rad_pinyin":
-        return {"type":t,"word_id":rad_id,"is_radical":True,
-            "prompt":f"Radical\n\n<b>{rad['radical']}</b>  -  {rad['meaning_en']}\n\nType the pinyin with tones:",
-            "answer":rad["pinyin"],
-            "reveal":f"{rad['radical']} pinyin: {rad['pinyin']}"}
-    return {}
-
-
-# ── SESSION ───────────────────────────────────────────────────────────────────
-
-def reset_daily(user):
-    today = datetime.utcnow().date().isoformat()
-    if user.get("session_date") == today:
-        return
-    yesterday = (datetime.utcnow().date() - timedelta(1)).isoformat()
-    if user.get("last_date") == yesterday:
-        user["streak"] += 1
-    elif user.get("last_date") != today:
-        user["streak"] = 1
-    user.update({"session_date":today,"new_today":0,"rad_new_today":0,
-                 "correct_today":0,"total_today":0,"errors_today":0,
-                 "today_ids":[],"today_rad_ids":[],"round_num":0,"in_round":False})
-
-def adjust_pace(user):
-    if user["total_today"] < 10: return
-    rate = user["correct_today"] / user["total_today"]
-    t = user["daily_new"]
-    if rate < MIN_RETENTION: user["daily_new"] = max(5, t-2)
-    elif rate > MAX_RETENTION: user["daily_new"] = min(20, t+1)
-
-def current_hsk_level(user):
-    seen = set(user["vocab_seen"])
-    for lv in range(1, 7):
-        pool = [w for w in HSK_WORDS if w["hsk"] == lv]
-        if len([w for w in pool if w["id"] in seen]) < len(pool) * 0.8:
-            return lv
-    return 6
-
-def build_main_queue(user):
-    queue = []
-    # Due reviews
-    for wid in due_ids(user["vocab_cards"]):
-        queue.append({"kind":"vocab","id":wid,"forced_type":None})
-        if wid not in user["today_ids"]: user["today_ids"].append(wid)
-        if wid not in user.get("week_ids",[]): user.setdefault("week_ids",[]).append(wid)
-
-    # New words: tutor-added (custom) words come FIRST so lesson vocab
-    # enters review promptly, then the radical cluster, then general pool.
-    seen_set = set(user["vocab_seen"])
-    custom_pool = [w for w in HSK_WORDS if w["id"].startswith("c_") and w["id"] not in seen_set]
-    new_vocab = introduce_items(user["vocab_seen"], user["vocab_cards"], custom_pool,
-                                max(0, user["daily_new"] - user["new_today"]))
-    user["new_today"] += len(new_vocab)
-
-    remaining_new = max(0, user["daily_new"] - user["new_today"])
-    tmr_rad = user.get("tomorrow_radical_id")
-    if remaining_new > 0:
-        if tmr_rad:
-            _, cluster_words = get_radical_cluster(tmr_rad)
-            cluster_pool = [w for w in cluster_words if w["id"] not in set(user["vocab_seen"])]
-            more = introduce_items(user["vocab_seen"], user["vocab_cards"], cluster_pool, remaining_new)
-            if len(more) < remaining_new:
-                extra = introduce_items(user["vocab_seen"], user["vocab_cards"], HSK_WORDS,
-                                        remaining_new - len(more))
-                more += extra
-        else:
-            more = introduce_items(user["vocab_seen"], user["vocab_cards"], HSK_WORDS, remaining_new)
-        new_vocab += more
-        user["new_today"] += len(more)
-
-    for wid in new_vocab:
-        queue.append({"kind":"vocab","id":wid,"forced_type":None})
-        if wid not in user["today_ids"]: user["today_ids"].append(wid)
-        if wid not in user.get("week_ids",[]): user.setdefault("week_ids",[]).append(wid)
-
-    # Radicals
-    for rid in due_ids(user["radical_cards"]):
-        queue.append({"kind":"radical","id":rid,"forced_type":None})
-        if rid not in user["today_rad_ids"]: user["today_rad_ids"].append(rid)
-
-    if current_hsk_level(user) <= RADICAL_PHASE:
-        new_rads = introduce_items(user["radical_seen"], user["radical_cards"], RADICALS, max(0, RADICAL_DAILY - user["rad_new_today"]))
-        user["rad_new_today"] += len(new_rads)
-        for rid in new_rads:
-            queue.append({"kind":"radical","id":rid,"forced_type":None})
-            if rid not in user["today_rad_ids"]: user["today_rad_ids"].append(rid)
-
-    random.shuffle(queue)
-    return queue
-
-
-# ── SENDING ───────────────────────────────────────────────────────────────────
-
-async def send_task(context, task, chat_id):
-    if "options" in task:
-        kb = [[InlineKeyboardButton(o, callback_data=f"ans:{i}")] for i, o in enumerate(task["options"])]
-        await context.bot.send_message(chat_id=chat_id, text=task["prompt"],
-            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await context.bot.send_message(chat_id=chat_id, text=task["prompt"], parse_mode="HTML")
-
-async def send_summary(context, chat_id, user, is_round=False, is_weektest=False):
-    correct = user["correct_today"]
-    total = user["total_today"]
-    rate = f"{correct/total*100:.0f}%" if total else "n/a"
-    weak = len(get_weak_ids(user))
-    seen_vocab = set(user["vocab_seen"])
-    bars = []
-    for lv in range(1, 7):
-        pool = [w for w in HSK_WORDS if w["hsk"] == lv]
-        done = sum(1 for w in pool if w["id"] in seen_vocab)
-        pct = done / len(pool)
-        bar = chr(9608)*round(pct*8) + chr(9617)*(8-round(pct*8))
-        bars.append(f"HSK {lv}: [{bar}] {done}/{len(pool)}")
-
-    if is_weektest:
-        label = "Weekly Test Complete"
-        hint = "\n\nStruggling words have been flagged for extra review next week."
-    elif is_round:
-        label = f"Round {user['round_num']} complete"
-        hint = "\n\nUse /round for another angle, or /done to finish."
-    else:
-        label = "Session complete"
-        hint = "\n\nUse /round for extra practice today."
-
-    await context.bot.send_message(chat_id=chat_id, parse_mode="HTML",
-        text=(f"<b>{label}</b>\n\n"
-              f"Today: {correct}/{total} correct ({rate})\n"
-              f"Streak: {user['streak']} days\n"
-              f"Weak cards: {weak}\n\n"
-              f"<b>HSK Progress</b>\n" + "\n".join(bars) + hint))
-
-
-# ── ANSWER CHECKING ───────────────────────────────────────────────────────────
-
-def norm(s): return s.strip().lower()
-
-def check_text(task, answer):
-    t = task["type"]
-    if t in ("recognition","rad_recognition"):
-        targets = [task["answer"]] + task.get("alt_answers",[])
-        a = norm(answer)
-        return any(norm(x) in a or a in norm(x) for x in targets if x)
-    if t in ("pinyin_input","rad_pinyin"):
-        return norm(answer) == norm(task["answer"])
-    if t in ("production","fill_blank","grammar_blank"):
-        return answer.strip() == task["answer"].strip()
-    return False
-
-
-# ── ADVANCE ───────────────────────────────────────────────────────────────────
-
-async def advance(context, chat_id, uid, correct):
-    data = load_data()
-    user = get_user(data, uid)
-    task = user["current_task"]
-    wid = task["word_id"]
-    is_rad = task.get("is_radical", False)
-    quality = 4 if correct else 1
-
-    if not correct:
-        ec = user.setdefault("error_counts", {})
-        ec[wid] = ec.get(wid, 0) + 1
-        user["errors_today"] = user.get("errors_today", 0) + 1
-
-    if is_rad:
-        user["radical_cards"][wid] = sm2_update(user["radical_cards"].get(wid,{}), quality)
-    else:
-        user["vocab_cards"][wid] = sm2_update(user["vocab_cards"].get(wid,{}), quality)
-
-    user["total_today"] += 1
-    user["correct_today"] += int(correct)
-
-    in_round = user.get("in_round", False)
-    in_weektest = user.get("in_weektest", False)
-
-    if in_weektest:
-        idx = user["weektest_idx"] + 1
-        user["weektest_idx"] = idx
-        queue = user["weektest_queue"]
-        if idx >= len(queue):
-            # Flag struggling words (wrong in weektest) for boosted review
-            for item in queue:
-                wid2 = item["id"]
-                if wid2 in user["vocab_cards"]:
-                    ec = user.get("error_counts", {})
-                    if ec.get(wid2, 0) > 0:
-                        # Reset interval to force review
-                        user["vocab_cards"][wid2]["interval"] = 1
-                        user["vocab_cards"][wid2]["due"] = datetime.utcnow().date().isoformat()
-            user["current_task"] = None
-            user["in_weektest"] = False
-            user["week_ids"] = []
-            user["week_grammar"] = []
-            save_data(data)
-            await send_summary(context, chat_id, user, is_weektest=True)
-            return
-        next_item = queue[idx]
-    elif in_round:
-        idx = user["round_idx"] + 1
-        user["round_idx"] = idx
-        queue = user["round_queue"]
-        if idx >= len(queue):
-            user["current_task"] = None
-            user["in_round"] = False
-            save_data(data)
-            await send_summary(context, chat_id, user, is_round=True)
-            return
-        next_item = queue[idx]
-    else:
-        idx = user["q_idx"] + 1
-        user["q_idx"] = idx
-        queue = user["queue"]
-        if idx >= len(queue):
-            user["current_task"] = None
-            user["last_date"] = datetime.utcnow().date().isoformat()
-            save_data(data)
-            await send_summary(context, chat_id, user)
-            return
-        next_item = queue[idx]
-
-    ft = next_item.get("forced_type")
-    if next_item["kind"] == "radical":
-        next_task = build_radical_task(next_item["id"], user, ft)
-    elif next_item["kind"] == "grammar":
-        next_task = build_grammar_task(next_item["id"], user, ft)
-    else:
-        next_task = build_vocab_task(next_item["id"], user, ft)
-    user["current_task"] = next_task
-    save_data(data)
-    await asyncio.sleep(0.4)
-    await send_task(context, next_task, chat_id)
-
-
-# ── GRAMMAR ───────────────────────────────────────────────────────────────────
-# Rollout: a NEW grammar point every GRAMMAR_CYCLE (3) days.
-# On non-introduction days, an already-seen point recurs with fresh examples.
-# Every point touched during the week is added to the weekly test.
-
-def grammar_examples_for(point_id, exclude=None):
-    """Fresh example sentences for a grammar point, drawn from the sentence bank."""
-    pts = [s for s in SENTENCES if s["grammar"] == point_id]
-    random.shuffle(pts)
-    if exclude:
-        pts = [s for s in pts if s["sentence"] != exclude] or pts
-    return pts
-
-def next_grammar_point(user):
-    """The next unseen grammar point, gated by the learner's current HSK level."""
-    seen = set(user.get("grammar_seen", []))
-    level = current_hsk_level(user)
-    for g in GRAMMAR_POINTS:
-        if g["id"] not in seen and g["hsk"] <= level + 1:
-            return g
-    # all caught up: nothing new
-    return None
-
-def pick_review_grammar(user):
-    """An already-seen point to revisit on non-introduction days."""
-    seen = user.get("grammar_seen", [])
-    if not seen:
-        return None
-    gid = random.choice(seen)
-    return next((g for g in GRAMMAR_POINTS if g["id"] == gid), None)
-
-def format_grammar_new(point):
-    lines = [
-        f"New grammar point: {point['title']}",
-        "",
-        point["rule"],
-        "",
-        "Examples:",
-    ]
-    for ex in point["examples"]:
-        lines.append(f"  - {ex}")
-    lines.append("")
-    lines.append("This joins your weekly test on Sunday.")
-    return "\n".join(lines)
-
-def format_grammar_review(point):
-    lines = [
-        f"Grammar review: {point['title']}",
-        "",
-        point["rule"],
-        "",
-        "Fresh examples:",
-    ]
-    # Prefer sentence-bank examples not already in the canonical list
-    bank = grammar_examples_for(point["id"])
-    canonical = set(point["examples"])
-    fresh = [s for s in bank if s["sentence"] not in canonical][:3]
-    if fresh:
-        for s in fresh:
-            lines.append(f"  - {s['sentence']}  ({s['translation']})")
-    else:
-        for ex in point["examples"]:
-            lines.append(f"  - {ex}")
-    return "\n".join(lines)
-
-def run_daily_grammar(user):
-    """Decide today's grammar message. Returns (text, is_new) or (None, False)."""
-    today = datetime.utcnow().date().isoformat()
-    if user.get("last_grammar_date") == today:
-        return None, False  # already delivered today
-    day = user.get("grammar_day", 0)
-    is_intro_day = (day % GRAMMAR_CYCLE == 0)
-
-    point = None
-    is_new = False
-    if is_intro_day:
-        point = next_grammar_point(user)
-        if point:
-            is_new = True
-            user.setdefault("grammar_seen", []).append(point["id"])
-        else:
-            point = pick_review_grammar(user)  # nothing new -> review
-    else:
-        point = pick_review_grammar(user)
-
-    user["grammar_day"] = day + 1
-    user["last_grammar_date"] = today
-    if not point:
-        return None, False
-
-    # Track for the weekly test
-    wk = user.setdefault("week_grammar", [])
-    if point["id"] not in wk:
-        wk.append(point["id"])
-
-    text = format_grammar_new(point) if is_new else format_grammar_review(point)
-    return text, is_new
-
-
-# ── COMMANDS ──────────────────────────────────────────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    get_user(data, update.effective_user.id)
-    save_data(data)
-    await update.message.reply_text(
-        "<b>HSK Trainer Bot</b>\n\n"
-        "Target: HSK 5 in 7 months, HSK 6 in 8 months\n\n"
-        "<b>How it works</b>\n"
-        "Each evening you get a preview: tomorrow's radical + all words built on it\n"
-        "Write them in your notebook, sleep on it\n"
-        "Morning: practice those exact words\n"
-        "Use /round for extra angles on the same words\n"
-        "A grammar point every 3 days (reviews in between) via /grammar\n"
-        "Sunday: /weektest tests this week's words AND grammar\n\n"
-        "<b>Commands</b>\n"
-        "/study - start today's session (+ today's grammar)\n"
-        "/round - extra practice (new angle each time)\n"
-        "/add - add words from your tutor lesson\n"
-        "/grammar - today's grammar point or a review\n"
-        "/weektest - Sunday grand test\n"
-        "/stats - your progress\n"
-        "/settime 8 - morning reminder (UTC)\n"
-        "/seteveningtime 15 - evening preview time, UTC (15=10PM Thai)\n"
-        "/pause and /resume - toggle reminders\n"
-        "/done - end session early",
-        parse_mode="HTML")
-
-async def cmd_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    uid = update.effective_user.id
-    user = get_user(data, uid)
-    reset_daily(user)
-    adjust_pace(user)
-
-    queue = build_main_queue(user)
-    if not queue:
-        await update.message.reply_text(
-            "Nothing due right now.\nUse /round to drill today's words, or /stats to check progress.")
-        save_data(data)
-        return
-
-    user["queue"] = queue
-    user["q_idx"] = 0
-    user["in_round"] = False
-    user["in_weektest"] = False
-
-    vc = sum(1 for q in queue if q["kind"] == "vocab")
-    rc = sum(1 for q in queue if q["kind"] == "radical")
-    wc = len(get_weak_ids(user))
-    # New vs review breakdown so the next-day overlap is understood, not mistaken for a bug
-    new_count = user.get("new_today", 0)
-    review_count = max(0, vc - new_count)
-    tmr_rad = user.get("tomorrow_radical_id")
-    rad_note = ""
-    if tmr_rad:
-        rad = next((r for r in RADICALS if r["id"] == tmr_rad), None)
-        if rad:
-            rad_note = f"\nToday's cluster: {rad['radical']} ({rad['meaning_en']})"
-
-    await update.message.reply_text(
-        f"<b>Today: {len(queue)} cards</b>\n"
-        f"New words: {new_count}  |  Reviews: {review_count}  |  Radicals: {rc}\n"
-        f"Weak cards: {wc}{rad_note}\n\n"
-        f"<i>Reviews include yesterday's words on purpose - seeing them again "
-        f"the next day is what locks them in. The gap grows each time you get them right.</i>\n\n"
-        f"After this, use /round for extra practice.", parse_mode="HTML")
-
-    # Daily grammar (one point; new every 3 days, review in between)
-    gtext, _is_new = run_daily_grammar(user)
-    if gtext:
-        await update.message.reply_text(gtext)
-
-    first = queue[0]
-    task = (build_radical_task(first["id"], user, first.get("forced_type"))
-            if first["kind"] == "radical"
-            else build_vocab_task(first["id"], user, first.get("forced_type")))
-    user["current_task"] = task
-    save_data(data)
-    await send_task(context, task, update.effective_chat.id)
-
-async def cmd_round(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    uid = update.effective_user.id
-    user = get_user(data, uid)
-
-    if not user["today_ids"] and not user["today_rad_ids"]:
-        await update.message.reply_text("No words studied today yet. Start with /study first!")
-        save_data(data)
-        return
-
-    user["round_num"] += 1
-    rn = user["round_num"]
-    queue = build_round_queue(user)
-    if not queue:
-        await update.message.reply_text("Nothing to practice. Do /study first.")
-        save_data(data)
-        return
-
-    user["round_queue"] = queue
-    user["round_idx"] = 0
-    user["in_round"] = True
-    user["in_weektest"] = False
-
-    weak_count = len(get_weak_ids(user))
-    angle = {1:"character shown, type meaning",
-             2:"pinyin shown, MCQ or type character",
-             3:"meaning shown, type character"}.get(rn,"full random mix")
-
-    await update.message.reply_text(
-        f"<b>Round {rn}</b>  -  {len(queue)} cards\n"
-        f"Angle: {angle}\n"
-        f"Includes {weak_count} weak card(s)\n\n"
-        f"/done to stop anytime.", parse_mode="HTML")
-
-    first = queue[0]
-    task = (build_radical_task(first["id"], user, first.get("forced_type"))
-            if first["kind"] == "radical"
-            else build_vocab_task(first["id"], user, first.get("forced_type")))
-    user["current_task"] = task
-    save_data(data)
-    await send_task(context, task, update.effective_chat.id)
-
-async def cmd_weektest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    uid = update.effective_user.id
-    user = get_user(data, uid)
-
-    queue = build_weekly_test_queue(user)
-    if not queue:
-        await update.message.reply_text(
-            "No words from this week yet. Study some words first, then come back on Sunday!")
-        save_data(data)
-        return
-
-    user["weektest_queue"] = queue
-    user["weektest_idx"] = 0
-    user["in_weektest"] = True
-    user["in_round"] = False
-
-    vocab_n = sum(1 for q in queue if q["kind"] == "vocab")
-    gram_n = sum(1 for q in queue if q["kind"] == "grammar")
-    await update.message.reply_text(
-        f"<b>Weekly Grand Test</b>\n\n"
-        f"{vocab_n} words + {gram_n} grammar points from this week\n"
-        f"Hard tasks only: writing, pinyin, fill-in-the-blank\n"
-        f"Struggling words will be flagged for extra review next week.\n\n"
-        f"/done to stop anytime.", parse_mode="HTML")
-
-    first = queue[0]
-    if first["kind"] == "grammar":
-        task = build_grammar_task(first["id"], user, first.get("forced_type"))
-    else:
-        task = build_vocab_task(first["id"], user, first.get("forced_type"))
-    user["current_task"] = task
-    save_data(data)
-    await send_task(context, task, update.effective_chat.id)
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    seen_vocab = set(user["vocab_seen"])
-    seen_rads = set(user["radical_seen"])
-    known = sum(1 for c in user["vocab_cards"].values() if c.get("reps",0) >= 3)
-    weak = len(get_weak_ids(user))
-    custom_total = sum(1 for w in HSK_WORDS if w["id"].startswith("c_"))
-    custom_seen = sum(1 for wid in seen_vocab if wid.startswith("c_"))
-    lines = []
-    for lv in range(1, 7):
-        pool = [w for w in HSK_WORDS if w["hsk"] == lv]
-        done = sum(1 for w in pool if w["id"] in seen_vocab)
-        pct = round(done/len(pool)*100)
-        bar = chr(9608)*round(pct/10) + chr(9617)*(10-round(pct/10))
-        lines.append(f"HSK {lv}: [{bar}] {pct}%  ({done}/{len(pool)})")
-    tutor_line = f"Tutor words: {custom_seen}/{custom_total} in review\n" if custom_total else ""
-    await update.message.reply_text(
-        f"<b>Your Progress</b>\n\n"
-        f"Streak: {user['streak']} days\n"
-        f"Vocab introduced: {len(seen_vocab)}/{len(HSK_WORDS)}\n"
-        f"Vocab solid (3+ correct): {known}\n"
-        f"Weak cards (3+ errors): {weak}\n"
-        f"{tutor_line}"
-        f"Radicals seen: {len(seen_rads)}/50\n"
-        f"Daily new target: {user['daily_new']}/day\n\n"
-        + "\n".join(lines), parse_mode="HTML")
-
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    uid = update.effective_user.id
-    user = get_user(data, uid)
-    user["last_date"] = datetime.utcnow().date().isoformat()
-    user["current_task"] = None
-    user["in_round"] = False
-    user["in_weektest"] = False
-    save_data(data)
-    await send_summary(context, update.effective_chat.id, user)
-
-async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    user["paused"] = True
-    save_data(data)
-    await update.message.reply_text("Reminders paused. /resume to turn back on.")
-
-async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    user["paused"] = False
-    save_data(data)
-    await update.message.reply_text("Reminders back on!")
-
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    try:
-        h = int(context.args[0])
-        assert 0 <= h <= 23
-        user["push_hour"] = h
-        save_data(data)
-        await update.message.reply_text(f"Morning reminder set to {h:02d}:00 UTC.")
-    except:
-        await update.message.reply_text("Usage: /settime HH  e.g. /settime 8")
-
-async def cmd_seteveningtime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    try:
-        h = int(context.args[0])
-        assert 0 <= h <= 23
-        user["evening_hour"] = h
-        save_data(data)
-        await update.message.reply_text(f"Evening preview set to {h:02d}:00 UTC.\n(UTC+7: that's {(h+7)%24:02d}:00 local)")
-    except:
-        await update.message.reply_text("Usage: /seteveningtime HH  e.g. /seteveningtime 15 (= 22:00 / 10PM Thailand)")
-
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a tutor word: /add character, pinyin, meaning
-    The word becomes a normal review card mixed into daily sessions."""
-    raw = update.message.text
-    # strip the command itself, keep everything after /add
-    body = raw[len("/add"):].strip()
-    if not body:
-        await update.message.reply_text(
-            "Add a word from your lesson like this:\n\n"
-            "<b>/add 桌子, zhuōzi, table</b>\n\n"
-            "Format: character, pinyin, meaning (separated by commas).\n"
-            "You can add several at once, one per line:\n\n"
-            "/add 桌子, zhuōzi, table\n"
-            "椅子, yǐzi, chair\n"
-            "窗户, chuānghu, window\n\n"
-            "They'll mix into your normal reviews starting next /study.",
-            parse_mode="HTML")
-        return
-
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-
-    # Support multiple lines; first line had /add stripped already
-    lines = [body] + raw.split("\n")[1:]
-    added, promoted, failed = [], [], []
-    today = datetime.utcnow().date().isoformat()
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        # accept Chinese comma 、／， or ASCII comma
-        parts = [p.strip() for p in line.replace("，", ",").replace("、", ",").split(",")]
-        parts = [p for p in parts if p]
-        if len(parts) < 3:
-            failed.append(line)
-            continue
-        char, pinyin, meaning = parts[0], parts[1], ", ".join(parts[2:])
-
-        # If the word already exists in the pool (e.g. it's an HSK word you
-        # haven't reached yet), PROMOTE it: pull it into active review now,
-        # regardless of its HSK level.
-        existing = next((w for w in HSK_WORDS if w["char"] == char), None)
-        if existing:
-            wid = existing["id"]
-            if wid not in set(user["vocab_seen"]):
-                user["vocab_seen"].append(wid)
-                user["vocab_cards"][wid] = {"ease": SM2_EASE_INIT, "interval": 0,
-                                            "reps": 0, "due": today}
-                promoted.append(f"{existing['char']} [{existing['pinyin']}] - {existing['meaning_en']} (HSK {existing['hsk']})")
-            else:
-                # already in your pile: just bring it forward for review today
-                if wid in user["vocab_cards"]:
-                    user["vocab_cards"][wid]["due"] = today
-                promoted.append(f"{existing['char']} [{existing['pinyin']}] - already learning, moved up")
-            continue
-
-        # Otherwise it's a brand-new word: add as a custom tutor word
-        word = {
-            "id": next_custom_id(), "hsk": 0, "char": char, "pinyin": pinyin,
-            "meaning_en": meaning, "meaning_ru": "",
-            "radical_id": "r46", "phonetic": None,
-            "homophones": [], "synonyms": [], "alt_en": [],
-            "notes": "Added from tutor lesson",
-        }
-        append_custom_word(word)
-        added.append(f"{char} [{pinyin}] - {meaning}")
-
-    save_data(data)
-
-    msg = ""
-    if added:
-        msg += f"<b>Added {len(added)} new word(s):</b>\n" + "\n".join(added)
-    if promoted:
-        if msg: msg += "\n\n"
-        msg += (f"<b>Pulled forward {len(promoted)} word(s) you'll learn now:</b>\n"
-                + "\n".join(promoted))
-    if added or promoted:
-        msg += ("\n\nThese enter your next /study session and flow into reviews, "
-                "weak-card tracking, and the weekly test.")
-    if failed:
-        msg += ("\n\n<b>Couldn't read:</b>\n" + "\n".join(failed) +
-                "\n\nUse: character, pinyin, meaning")
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def cmd_grammar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = get_user(data, update.effective_user.id)
-    gtext, _is_new = run_daily_grammar(user)
-    if not gtext:
-        # already delivered today, or nothing to show -> show a review point
-        point = pick_review_grammar(user)
-        if point:
-            gtext = format_grammar_review(point)
-        else:
-            gtext = ("No grammar points yet - start a /study session and your first "
-                     "point will appear. A new point arrives every 3 days, with "
-                     "reviews in between, and all of the week's points join the Sunday test.")
-    save_data(data)
-    await update.message.reply_text(gtext)
-
-
-# ── MESSAGE AND CALLBACK ──────────────────────────────────────────────────────
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    uid = update.effective_user.id
-    user = get_user(data, uid)
-    task = user.get("current_task")
-    if not task or "options" in task:
-        save_data(data)
-        return
-    correct = check_text(task, update.message.text)
-    reveal = task.get("reveal","")
-    if correct:
-        await update.message.reply_text(f"Correct!\n<i>{reveal}</i>", parse_mode="HTML")
-    else:
-        await update.message.reply_text(f"Not quite.\n<b>{reveal}</b>", parse_mode="HTML")
-    await advance(context, update.effective_chat.id, uid, correct)
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = load_data()
-    uid = query.from_user.id
-    user = get_user(data, uid)
-    task = user.get("current_task")
-    if not task or "options" not in task:
-        return
-    chosen = int(query.data.split(":")[1])
-    correct = chosen == task["correct_idx"]
-    reveal = task.get("reveal","")
-    await query.edit_message_reply_markup(reply_markup=None)
-    if correct:
-        await query.message.reply_text(f"Correct!\n<i>{reveal}</i>", parse_mode="HTML")
-    else:
-        ans = task["options"][task["correct_idx"]]
-        await query.message.reply_text(f"Wrong - correct: <b>{ans}</b>\n<i>{reveal}</i>", parse_mode="HTML")
-    await advance(context, query.message.chat_id, uid, correct)
-
-
-# ── SCHEDULED JOBS ────────────────────────────────────────────────────────────
-
-async def morning_push(context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    now_hour = datetime.utcnow().hour
-    today = datetime.utcnow().date().isoformat()
-    for uid_str, user in data.items():
-        if user.get("paused"): continue
-        if user.get("push_hour", MORNING_HOUR) != now_hour: continue
-        if user.get("last_date") == today: continue
-        due_v = len(due_ids(user["vocab_cards"]))
-        due_r = len(due_ids(user["radical_cards"]))
-        # Sunday = weekday 6
-        is_sunday = datetime.utcnow().weekday() == 6
-        sunday_note = "\n\nIt's Sunday - use /weektest for your weekly grand test!" if is_sunday else ""
-        try:
-            await context.bot.send_message(chat_id=int(uid_str), parse_mode="HTML",
-                text=(f"<b>Time to study!</b>\n\n"
-                      f"{due_v} vocab + {due_r} radical reviews due\n"
-                      f"~{user['daily_new']} new words\n\n"
-                      f"/study to start{sunday_note}"))
-        except Exception as e:
-            logger.warning(f"Push failed for {uid_str}: {e}")
-
-async def evening_preview(context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    now_hour = datetime.utcnow().hour
-    for uid_str, user in data.items():
-        if user.get("paused"): continue
-        if user.get("evening_hour", EVENING_HOUR) != now_hour: continue
-        # Pick tomorrow's radical
-        next_rad_id = pick_next_radical(user)
-        user["tomorrow_radical_id"] = next_rad_id
-        preview = format_evening_preview(next_rad_id)
-        try:
-            await context.bot.send_message(chat_id=int(uid_str), text=preview)
-        except Exception as e:
-            logger.warning(f"Evening preview failed for {uid_str}: {e}")
-    save_data(data)
-
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-
-def main():
-    load_custom_words()  # merge any tutor-added words into the pool
-    app = Application.builder().token(BOT_TOKEN).build()
-    for cmd, fn in [
-        ("start", cmd_start), ("study", cmd_study), ("round", cmd_round),
-        ("weektest", cmd_weektest), ("stats", cmd_stats), ("done", cmd_done),
-        ("pause", cmd_pause), ("resume", cmd_resume),
-        ("settime", cmd_settime), ("seteveningtime", cmd_seteveningtime),
-        ("grammar", cmd_grammar), ("add", cmd_add),
-    ]:
-        app.add_handler(CommandHandler(cmd, fn))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.job_queue.run_repeating(morning_push, interval=3600, first=30)
-    app.job_queue.run_repeating(evening_preview, interval=3600, first=60)
-    logger.info("Bot running.")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+# sentences.py - fill-in-the-blank sentences tagged by grammar point
+# Each: sentence (with target word), translation, hsk, grammar (tag matching GRAMMAR_POINTS)
+
+SENTENCES = [
+    # ---- HSK 1: basic SVO, 是, 有, 很+adj ----
+    {"sentence":"我是学生。","translation":"I am a student.","hsk":1,"grammar":"shi_to_be"},
+    {"sentence":"他是老师。","translation":"He is a teacher.","hsk":1,"grammar":"shi_to_be"},
+    {"sentence":"这是我的书。","translation":"This is my book.","hsk":1,"grammar":"de_possessive"},
+    {"sentence":"那是你的杯子。","translation":"That is your cup.","hsk":1,"grammar":"de_possessive"},
+    {"sentence":"我有一个朋友。","translation":"I have a friend.","hsk":1,"grammar":"you_have"},
+    {"sentence":"她有两个孩子。","translation":"She has two children.","hsk":1,"grammar":"you_have"},
+    {"sentence":"今天很热。","translation":"Today is very hot.","hsk":1,"grammar":"hen_adj"},
+    {"sentence":"这个菜很好吃。","translation":"This dish is delicious.","hsk":1,"grammar":"hen_adj"},
+    {"sentence":"我喜欢喝茶。","translation":"I like to drink tea.","hsk":1,"grammar":"svo_basic"},
+    {"sentence":"我们去学校。","translation":"We go to school.","hsk":1,"grammar":"svo_basic"},
+    {"sentence":"你叫什么名字？","translation":"What is your name?","hsk":1,"grammar":"question_what"},
+    {"sentence":"现在几点？","translation":"What time is it now?","hsk":1,"grammar":"question_what"},
+    {"sentence":"我不是中国人。","translation":"I am not Chinese.","hsk":1,"grammar":"bu_negation"},
+    {"sentence":"他不喝咖啡。","translation":"He doesn't drink coffee.","hsk":1,"grammar":"bu_negation"},
+    {"sentence":"你好吗？","translation":"How are you?","hsk":1,"grammar":"ma_question"},
+    {"sentence":"你是医生吗？","translation":"Are you a doctor?","hsk":1,"grammar":"ma_question"},
+
+    # ---- HSK 2: 了, 在+verb, 比, 想/要, 因为...所以 ----
+    {"sentence":"我吃了饭。","translation":"I have eaten.","hsk":2,"grammar":"le_completed"},
+    {"sentence":"他买了一本书。","translation":"He bought a book.","hsk":2,"grammar":"le_completed"},
+    {"sentence":"我正在看电视。","translation":"I am watching TV.","hsk":2,"grammar":"zai_progressive"},
+    {"sentence":"她在做作业。","translation":"She is doing homework.","hsk":2,"grammar":"zai_progressive"},
+    {"sentence":"我比你高。","translation":"I am taller than you.","hsk":2,"grammar":"bi_comparison"},
+    {"sentence":"今天比昨天冷。","translation":"Today is colder than yesterday.","hsk":2,"grammar":"bi_comparison"},
+    {"sentence":"我想去北京。","translation":"I want to go to Beijing.","hsk":2,"grammar":"xiang_want"},
+    {"sentence":"我要喝水。","translation":"I want to drink water.","hsk":2,"grammar":"yao_want"},
+    {"sentence":"因为下雨，所以我不去。","translation":"Because it's raining, I won't go.","hsk":2,"grammar":"yinwei_suoyi"},
+    {"sentence":"虽然很累，但是很高兴。","translation":"Although tired, I'm happy.","hsk":2,"grammar":"suiran_danshi"},
+    {"sentence":"我已经吃过了。","translation":"I have already eaten.","hsk":2,"grammar":"guo_experiential"},
+    {"sentence":"我去过中国。","translation":"I have been to China.","hsk":2,"grammar":"guo_experiential"},
+    {"sentence":"请给我一杯茶。","translation":"Please give me a cup of tea.","hsk":2,"grammar":"gei_give"},
+    {"sentence":"他送给我一个礼物。","translation":"He gave me a gift.","hsk":2,"grammar":"gei_give"},
+    {"sentence":"如果你来，我很高兴。","translation":"If you come, I'll be happy.","hsk":2,"grammar":"ruguo_if"},
+    {"sentence":"我从北京来。","translation":"I come from Beijing.","hsk":2,"grammar":"cong_from"},
+
+    # ---- HSK 3: 把, 被, 着, 把...complement, 越来越, 一边...一边 ----
+    {"sentence":"我把书放在桌子上。","translation":"I put the book on the table.","hsk":3,"grammar":"ba_disposal"},
+    {"sentence":"请把门关上。","translation":"Please close the door.","hsk":3,"grammar":"ba_disposal"},
+    {"sentence":"我的自行车被偷了。","translation":"My bike was stolen.","hsk":3,"grammar":"bei_passive"},
+    {"sentence":"他被老师批评了。","translation":"He was criticized by the teacher.","hsk":3,"grammar":"bei_passive"},
+    {"sentence":"门开着。","translation":"The door is open.","hsk":3,"grammar":"zhe_continuous"},
+    {"sentence":"他穿着一件红衣服。","translation":"He is wearing red clothes.","hsk":3,"grammar":"zhe_continuous"},
+    {"sentence":"天气越来越冷。","translation":"The weather is getting colder and colder.","hsk":3,"grammar":"yuelaiyue"},
+    {"sentence":"他的中文越来越好。","translation":"His Chinese is getting better and better.","hsk":3,"grammar":"yuelaiyue"},
+    {"sentence":"我一边吃饭一边看电视。","translation":"I eat while watching TV.","hsk":3,"grammar":"yibian_yibian"},
+    {"sentence":"她一边走一边唱歌。","translation":"She sings while walking.","hsk":3,"grammar":"yibian_yibian"},
+    {"sentence":"只要努力就能成功。","translation":"As long as you work hard, you can succeed.","hsk":3,"grammar":"zhiyao_jiu"},
+    {"sentence":"不但聪明，而且认真。","translation":"Not only smart, but also diligent.","hsk":3,"grammar":"budan_erqie"},
+    {"sentence":"我是坐地铁来的。","translation":"I came by subway.","hsk":3,"grammar":"shi_de_emphasis"},
+    {"sentence":"他是昨天到的。","translation":"It was yesterday that he arrived.","hsk":3,"grammar":"shi_de_emphasis"},
+    {"sentence":"这本书比那本有意思。","translation":"This book is more interesting than that one.","hsk":3,"grammar":"bi_comparison"},
+    {"sentence":"他跑得很快。","translation":"He runs very fast.","hsk":3,"grammar":"de_complement"},
+    {"sentence":"她说得很清楚。","translation":"She speaks very clearly.","hsk":3,"grammar":"de_complement"},
+    {"sentence":"我看完了那本书。","translation":"I finished reading that book.","hsk":3,"grammar":"resultative_complement"},
+    {"sentence":"我听懂了老师的话。","translation":"I understood the teacher's words.","hsk":3,"grammar":"resultative_complement"},
+    {"sentence":"为了学好中文，我每天练习。","translation":"To learn Chinese well, I practice every day.","hsk":3,"grammar":"weile_purpose"},
+    {"sentence":"虽然很难，但是我喜欢。","translation":"Although it's hard, I like it.","hsk":3,"grammar":"suiran_danshi"},
+    {"sentence":"他不但会说中文，还会写汉字。","translation":"He can not only speak Chinese but also write characters.","hsk":3,"grammar":"budan_erqie"},
+    {"sentence":"如果有时间，我就去旅游。","translation":"If I have time, I'll travel.","hsk":3,"grammar":"ruguo_if"},
+    {"sentence":"我把作业做完了。","translation":"I finished my homework.","hsk":3,"grammar":"ba_disposal"},
+    {"sentence":"请把这个字写在本子上。","translation":"Please write this character in the notebook.","hsk":3,"grammar":"ba_disposal"},
+    {"sentence":"他越说越快。","translation":"The more he speaks, the faster he goes.","hsk":3,"grammar":"yue_yue"},
+    {"sentence":"雨越下越大。","translation":"The rain falls heavier and heavier.","hsk":3,"grammar":"yue_yue"},
+    {"sentence":"我已经把饭吃完了。","translation":"I have already finished the meal.","hsk":3,"grammar":"ba_disposal"},
+    {"sentence":"他被妈妈叫回家了。","translation":"He was called home by his mother.","hsk":3,"grammar":"bei_passive"},
+    {"sentence":"桌子上放着一本书。","translation":"There is a book on the table.","hsk":3,"grammar":"zhe_continuous"},
+]
+
+# Grammar points: rolled out one new point every 3 days.
+# Between new points, earlier ones recur with fresh examples.
+# All points seen in a week feed into the weekly test.
+GRAMMAR_POINTS = [
+    {"id":"shi_to_be","hsk":1,"title":"是 - the verb 'to be'",
+     "rule":"是 (shi) links two nouns: A 是 B = 'A is B'. Never use 是 to connect a noun and an adjective - for that, use 很. Negate with 不: 不是.",
+     "examples":["我是学生。 - I am a student.","他不是老师。 - He is not a teacher.","这是书。 - This is a book."]},
+    {"id":"hen_adj","hsk":1,"title":"很 + adjective",
+     "rule":"To say 'X is [adjective]', use Subject + 很 + adjective. NO 是. 很 often just links - it doesn't always mean 'very'. Example: 我很好 = I'm fine (not 'I'm very good').",
+     "examples":["今天很热。 - Today is hot.","她很漂亮。 - She is pretty.","我们很忙。 - We are busy."]},
+    {"id":"you_have","hsk":1,"title":"有 - to have / there is",
+     "rule":"有 (you) = 'to have' or 'there is/are'. Negate ONLY with 没 (never 不): 没有. 'I don't have' = 我没有.",
+     "examples":["我有一本书。 - I have a book.","桌子上有杯子。 - There's a cup on the table.","我没有钱。 - I have no money."]},
+    {"id":"ma_question","hsk":1,"title":"吗 - yes/no questions",
+     "rule":"Add 吗 (ma) to the end of a statement to make it a yes/no question. The word order does NOT change. 你好 -> 你好吗?",
+     "examples":["你是学生吗？ - Are you a student?","他喝茶吗？ - Does he drink tea?","好吗？ - Is that okay?"]},
+    {"id":"de_possessive","hsk":1,"title":"的 - possession & description",
+     "rule":"的 (de) shows possession (我的书 = my book) or links a description to a noun (漂亮的花 = pretty flower). Pattern: [owner/adjective] + 的 + [noun].",
+     "examples":["我的手机 - my phone","老师的书 - the teacher's book","红色的车 - a red car"]},
+    {"id":"le_completed","hsk":2,"title":"了 - completed action",
+     "rule":"了 (le) after a verb marks a completed/realized action. 我吃了 = I ate. It also marks a change of state at sentence end: 下雨了 = it started raining.",
+     "examples":["我买了一本书。 - I bought a book.","他走了。 - He left.","天黑了。 - It got dark."]},
+    {"id":"zai_progressive","hsk":2,"title":"在 + verb - ongoing action",
+     "rule":"(正)在 + verb = an action in progress, like English '-ing'. 我在吃饭 = I am eating. Often paired with 呢 at the end.",
+     "examples":["我在看书。 - I am reading.","他正在睡觉。 - He is sleeping.","你在做什么呢？ - What are you doing?"]},
+    {"id":"bi_comparison","hsk":2,"title":"比 - comparisons",
+     "rule":"A 比 B + adjective = 'A is more [adjective] than B'. Do NOT add 很. To say 'much more', add 得多 or 多了 after: A 比 B 高得多.",
+     "examples":["我比你高。 - I'm taller than you.","今天比昨天热。 - Today is hotter than yesterday.","他比我大三岁。 - He's 3 years older than me."]},
+    {"id":"yao_want","hsk":2,"title":"要 / 想 - want to",
+     "rule":"想 (xiang) = would like to (softer). 要 (yao) = want to / will (stronger, more definite). 我想去 = I'd like to go; 我要去 = I want/intend to go.",
+     "examples":["我想喝茶。 - I'd like tea.","我要回家。 - I want to go home.","你想吃什么？ - What would you like to eat?"]},
+    {"id":"yinwei_suoyi","hsk":2,"title":"因为...所以... - because...therefore",
+     "rule":"因为 (because) + reason, 所以 (so/therefore) + result. Both halves can appear together - this is normal in Chinese, unlike English where you'd drop one.",
+     "examples":["因为下雨，所以我没去。 - Because it rained, I didn't go.","因为累，所以早睡了。 - Because tired, I slept early."]},
+    {"id":"guo_experiential","hsk":2,"title":"过 - experiential aspect",
+     "rule":"verb + 过 (guo) = 'have ever done' (a past experience). 我去过北京 = I have been to Beijing. Negate with 没: 没去过.",
+     "examples":["我吃过中国菜。 - I've eaten Chinese food.","他没看过这部电影。 - He hasn't seen this movie.","你去过吗？ - Have you ever been?"]},
+    {"id":"ruguo_if","hsk":2,"title":"如果...就... - if...then",
+     "rule":"如果 (if) + condition, (subject) 就 (then) + result. 就 sits right before the verb in the result clause.",
+     "examples":["如果下雨，我就不去。 - If it rains, I won't go.","如果你忙，就别来了。 - If you're busy, don't come."]},
+    {"id":"ba_disposal","hsk":3,"title":"把 - the disposal construction",
+     "rule":"把 (ba) moves the object BEFORE the verb to emphasize what happens to it. Pattern: Subject + 把 + object + verb + (complement/了). The verb must do something TO the object. 我把书放好了 = I put the book away.",
+     "examples":["我把门关上了。 - I closed the door.","请把这个拿走。 - Please take this away.","他把饭吃完了。 - He finished the food."]},
+    {"id":"bei_passive","hsk":3,"title":"被 - the passive",
+     "rule":"被 (bei) makes a passive sentence: Object + 被 + (doer) + verb + (result). 我的钱被偷了 = My money was stolen. The doer can be omitted.",
+     "examples":["杯子被打破了。 - The cup was broken.","他被老师表扬了。 - He was praised by the teacher.","书被借走了。 - The book was borrowed."]},
+    {"id":"zhe_continuous","hsk":3,"title":"着 - continuous state",
+     "rule":"verb + 着 (zhe) shows an ongoing STATE (not action). 门开着 = the door is (in the state of being) open. Often describes how something exists: 站着 = standing.",
+     "examples":["门开着。 - The door is open.","他笑着说。 - He said with a smile.","墙上挂着画。 - A painting hangs on the wall."]},
+    {"id":"de_complement","hsk":3,"title":"得 - complement of degree",
+     "rule":"verb + 得 (de) + adjective describes HOW WELL an action is done. 他跑得很快 = he runs fast. With an object: 他说中文说得很好 (repeat the verb).",
+     "examples":["她唱得很好。 - She sings well.","他来得很早。 - He came early.","你写得不错。 - You write quite well."]},
+    {"id":"resultative_complement","hsk":3,"title":"Resultative complements (完, 懂, 好...)",
+     "rule":"A second verb/adjective after the main verb shows the RESULT. 看完 = finish reading, 听懂 = understand (by hearing), 做好 = finish doing well. Negate with 没: 没看完.",
+     "examples":["我吃完了。 - I finished eating.","他听懂了。 - He understood.","作业做好了。 - The homework is done."]},
+    {"id":"weile_purpose","hsk":3,"title":"为了 - in order to",
+     "rule":"为了 (weile) + goal, then the action. 为了健康，我每天跑步 = For my health, I run daily. States the purpose first.",
+     "examples":["为了学中文，我去了中国。 - To learn Chinese, I went to China.","为了你，我什么都愿意。 - For you, I'd do anything."]},
+    {"id":"budan_erqie","hsk":3,"title":"不但...而且... - not only...but also",
+     "rule":"不但 (not only) + first point, 而且 (moreover) + second, stronger point. 还 or 也 can replace 而且.",
+     "examples":["他不但聪明，而且努力。 - Not only smart but also hardworking.","这里不但便宜，而且好吃。 - Not only cheap but also tasty."]},
+    {"id":"yuelaiyue","hsk":3,"title":"越来越 - more and more",
+     "rule":"越来越 + adjective = 'more and more [adjective]' over time. 天气越来越热 = the weather is getting hotter and hotter.",
+     "examples":["他越来越高了。 - He's getting taller.","我越来越喜欢中文。 - I like Chinese more and more."]},
+    {"id":"yue_yue","hsk":3,"title":"越...越... - the more...the more",
+     "rule":"越 + verb1 + 越 + verb2/adj = 'the more X, the more Y'. 越学越有意思 = the more you study, the more interesting it gets.",
+     "examples":["越说越快。 - The more he talks the faster he gets.","雨越下越大。 - The more it rains the harder it falls."]},
+    {"id":"yibian_yibian","hsk":3,"title":"一边...一边... - doing two things at once",
+     "rule":"一边 + verb1 + 一边 + verb2 = doing two actions simultaneously. 我一边吃饭一边看电视 = I watch TV while eating.",
+     "examples":["他一边走一边唱。 - He walks and sings.","别一边开车一边打电话。 - Don't phone while driving."]},
+    {"id":"zhiyao_jiu","hsk":3,"title":"只要...就... - as long as",
+     "rule":"只要 (as long as) + condition, 就 + result. 只要努力，就能成功 = as long as you work hard, you can succeed. Compare 只有...才 (only if).",
+     "examples":["只要你来，我就高兴。 - As long as you come, I'm happy.","只要有钱就行。 - As long as there's money it's fine."]},
+    {"id":"shi_de_emphasis","hsk":3,"title":"是...的 - emphasizing details",
+     "rule":"For a completed action, 是...的 emphasizes WHEN/WHERE/HOW it happened. 我是昨天来的 = It was yesterday that I came. The 是 can be dropped, 的 cannot.",
+     "examples":["我是坐飞机来的。 - I came by plane.","他是在北京出生的。 - He was born in Beijing."]},
+    # function-word helpers reused by HSK1 sentences
+    {"id":"svo_basic","hsk":1,"title":"Basic word order: S-V-O",
+     "rule":"Chinese basic order is Subject-Verb-Object, same as English. 我(S) 喝(V) 茶(O) = I drink tea. Time and place words go BEFORE the verb, not after.",
+     "examples":["我喝茶。 - I drink tea.","他看书。 - He reads books.","我们去学校。 - We go to school."]},
+    {"id":"question_what","hsk":1,"title":"Question words stay in place",
+     "rule":"In Chinese, question words (什么 what, 谁 who, 哪儿 where) sit where the answer would go - the sentence order does NOT change. 你吃什么? = You eat what?",
+     "examples":["你叫什么名字？ - What's your name?","他是谁？ - Who is he?","你去哪儿？ - Where are you going?"]},
+    {"id":"bu_negation","hsk":1,"title":"不 - general negation",
+     "rule":"不 (bu) negates verbs and adjectives (present/future/habit). 我不去 = I'm not going. The ONE exception: 有 is negated by 没, never 不.",
+     "examples":["我不喝酒。 - I don't drink alcohol.","他不高。 - He's not tall.","今天不冷。 - It's not cold today."]},
+    {"id":"gei_give","hsk":2,"title":"给 - to give / for",
+     "rule":"给 (gei) = give. Pattern: give + person + thing: 给我一本书. Also marks the recipient before a verb: 给你打电话 = call you.",
+     "examples":["请给我水。 - Please give me water.","我给你做饭。 - I'll cook for you."]},
+    {"id":"xiang_want","hsk":2,"title":"想 - would like / to miss",
+     "rule":"想 (xiang) + verb = would like to do (soft wish). 想 + noun/person = to miss. 我想你 = I miss you. 我想去 = I'd like to go.",
+     "examples":["我想休息。 - I'd like to rest.","我很想家。 - I miss home a lot."]},
+    {"id":"cong_from","hsk":2,"title":"从 - from (origin/start point)",
+     "rule":"从 (cong) marks a starting point in space or time. 从北京来 = come from Beijing. 从...到... = from...to...",
+     "examples":["我从中国来。 - I come from China.","从九点到五点。 - From 9 to 5."]},
+    {"id":"suiran_danshi","hsk":2,"title":"虽然...但是... - although",
+     "rule":"虽然 (although) + fact, 但是 (but) + contrasting point. BOTH halves appear together in Chinese - don't drop 但是 the way English drops 'but'.",
+     "examples":["虽然累，但是很开心。 - Although tired, very happy.","虽然贵，但是好。 - Although expensive, it's good."]},
+]
