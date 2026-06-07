@@ -4,15 +4,57 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-from vocabulary import HSK_WORDS
+from vocabulary import HSK_WORDS as _BASE_WORDS, RADICAL_DAYS
 from radicals import RADICALS
 from sentences import SENTENCES, GRAMMAR_POINTS
+
+# Combined pool: built-in HSK words + tutor-added custom words.
+# Everything (task building, clusters, reviews) reads from HSK_WORDS,
+# so appending custom words here makes them behave exactly like HSK words.
+HSK_WORDS = list(_BASE_WORDS)
+
+def load_custom_words():
+    """Load tutor-added words from disk and merge into the pool (no duplicates)."""
+    if not CUSTOM_FILE.exists():
+        return
+    try:
+        with open(CUSTOM_FILE) as f:
+            custom = json.load(f)
+    except Exception:
+        return
+    existing = {w["id"] for w in HSK_WORDS}
+    for w in custom:
+        if w["id"] not in existing:
+            HSK_WORDS.append(w)
+            existing.add(w["id"])
+
+def append_custom_word(word):
+    """Persist one new tutor word to disk and add it to the live pool."""
+    custom = []
+    if CUSTOM_FILE.exists():
+        try:
+            with open(CUSTOM_FILE) as f:
+                custom = json.load(f)
+        except Exception:
+            custom = []
+    custom.append(word)
+    with open(CUSTOM_FILE, "w") as f:
+        json.dump(custom, f, ensure_ascii=False, indent=2)
+    HSK_WORDS.append(word)
+
+def next_custom_id():
+    """Generate a unique id like 'c_001' for a new tutor word."""
+    n = sum(1 for w in HSK_WORDS if w["id"].startswith("c_")) + 1
+    while any(w["id"] == f"c_{n:03d}" for w in HSK_WORDS):
+        n += 1
+    return f"c_{n:03d}"
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 DATA_FILE      = Path("user_data.json")
+CUSTOM_FILE    = Path("custom_words.json")  # tutor-added words, survives user_data resets
 DEFAULT_NEW    = 12
 RADICAL_DAILY  = 3
 RADICAL_PHASE  = 3
@@ -21,7 +63,7 @@ MAX_RETENTION  = 0.92
 SM2_EASE_INIT  = 2.5
 SM2_EASE_MIN   = 1.3
 WEAK_THRESHOLD = 3
-EVENING_HOUR   = 20  # 20:00 UTC+7 = 13:00 UTC
+EVENING_HOUR   = 15  # 15:00 UTC = 22:00 (10 PM) Thailand time (UTC+7)
 MORNING_HOUR   = 8   # default study reminder
 GRAMMAR_CYCLE  = 3   # introduce a new grammar point every N days
 
@@ -70,6 +112,14 @@ def get_user(data, uid):
             "week_grammar": [],
             "last_grammar_date": None,
         }
+    else:
+        u = data[k]
+        # One-time migration: bump the OLD evening default (13 UTC = 20:00 Thai)
+        # to the new default (15 UTC = 22:00 Thai). Only touches users still on
+        # the old default; anyone who set a custom time with /seteveningtime keeps it.
+        if u.get("evening_hour") in (13, 20) and not u.get("_evening_migrated"):
+            u["evening_hour"] = EVENING_HOUR
+            u["_evening_migrated"] = True
     return data[k]
 
 
@@ -106,73 +156,70 @@ def introduce_items(seen, cards, pool, n):
 
 # ── RADICAL CLUSTER SYSTEM ────────────────────────────────────────────────────
 
+def get_day_by_number(day_num):
+    return next((d for d in RADICAL_DAYS if d["day"] == day_num), None)
+
 def get_radical_cluster(radical_id):
-    rad = next((r for r in RADICALS if r["id"] == radical_id), None)
-    if not rad:
-        return rad, []
-    words = [w for w in HSK_WORDS if w.get("radical_id") == radical_id]
-    return rad, words
+    """radical_id is now 'dayNN'. Returns (day_dict, its anchor+homophone cards)."""
+    if not radical_id or not radical_id.startswith("day"):
+        return None, []
+    try:
+        n = int(radical_id[3:])
+    except ValueError:
+        return None, []
+    day = get_day_by_number(n)
+    if not day:
+        return None, []
+    words = [w for w in HSK_WORDS if w.get("day") == n]
+    return day, words
 
 def pick_next_radical(user):
-    seen_rads = set(user["radical_seen"])
-    for r in RADICALS:
-        if r["id"] not in seen_rads:
-            return r["id"]
-    return RADICALS[0]["id"]
+    """Next unseen radical-day, as 'dayNN'. Falls back to day 1."""
+    seen_days = set()
+    for wid in user.get("vocab_seen", []):
+        w = next((x for x in HSK_WORDS if x["id"] == wid), None)
+        if w and w.get("day"):
+            seen_days.add(w["day"])
+    for d in RADICAL_DAYS:
+        if d["day"] not in seen_days:
+            return f"day{d['day']:02d}"
+    return f"day{RADICAL_DAYS[0]['day']:02d}"
+
+def _components_str(components):
+    parts = []
+    for c in components:
+        py = (c.get("pinyin") + ", ") if c.get("pinyin") else ""
+        parts.append(f"{c['part']} ({py}{c['gloss']})")
+    return "  +  ".join(parts)
 
 def format_evening_preview(radical_id):
-    rad, words = get_radical_cluster(radical_id)
-    if not rad:
-        return "No radical data found."
-
-    lines = [
-        f"Tonight's radical: {rad['radical']} ({rad['full']})",
-        f"Pinyin: {rad['pinyin']}",
-        f"Meaning: {rad['meaning_en']} / {rad['meaning_ru']}",
-        f"Example word: {rad['example']} ({rad['ex_pinyin']}) — {rad['ex_en']}",
+    day, _ = get_radical_cluster(radical_id)
+    if not day:
+        return "No lesson data found for tonight."
+    r = day["radical"]
+    L = [
+        f"Tonight's radical:  {r['char']}  ({r['pinyin']}) — {r['meaning']}",
         "",
-        "Write these in your notebook tonight:",
+        "Write these 5 words in your notebook before sleep:",
         "",
     ]
-
-    # Collect phonetic families
-    phonetic_groups = {}
-    for w in words:
-        ph = w.get("phonetic")
-        if ph:
-            phonetic_groups.setdefault(ph, []).append(w)
-
-    for w in words:
-        homophones = w.get("homophones", [])
-        synonyms = w.get("synonyms", [])
-        notes = w.get("notes", "")
-
-        line = f"{w['char']}  {w['pinyin']}  —  {w['meaning_en']} / {w['meaning_ru']}"
-        lines.append(line)
-
-        if homophones:
-            hp_str = ", ".join(f"{h['char']} ({h['pinyin']}) = {h['meaning_en']}" for h in homophones)
-            lines.append(f"   Sounds like: {hp_str}")
-
-        if synonyms:
-            sy_str = ", ".join(f"{s['char']} {s['pinyin']} = {s['meaning_en']}" for s in synonyms)
-            lines.append(f"   Similar meaning: {sy_str}")
-
-        if notes:
-            lines.append(f"   Note: {notes}")
-
-        lines.append("")
-
-    # Phonetic family note
-    if phonetic_groups:
-        lines.append("Phonetic families (same sound component):")
-        for ph, group in phonetic_groups.items():
-            chars = " / ".join(f"{w['char']}({w['pinyin']})" for w in group)
-            lines.append(f"   {ph}: {chars}")
-        lines.append("")
-
-    lines.append("Good night! Practice starts tomorrow morning.")
-    return "\n".join(lines)
+    for a in day["anchors"]:
+        L.append(f"{a['char']}  {a['pinyin']}  —  {a['meaning_en']}  (HSK {a['hsk']})")
+        L.append(f"    = {_components_str(a['components'])}")
+        if a.get("compose_note"):
+            L.append(f"    → {a['compose_note']}")
+        if a.get("homophones"):
+            L.append("    same sound, mind the tone:")
+            for h in a["homophones"]:
+                hc = " + ".join(f"{c['part']} ({c['gloss']})" for c in h.get("components", []))
+                extra = f"  [{hc}]" if hc else ""
+                L.append(f"       {h['char']} {h['pinyin']} = {h['meaning_en']}{extra}")
+        for s in a.get("synonyms", []):
+            note = f" ({s['note']})" if s.get("note") else ""
+            L.append(f"    synonym: {s['char']} {s['pinyin']} = {s['meaning_en']}{note}")
+        L.append("")
+    L.append("Good night — practice starts tomorrow morning.")
+    return "\n".join(L)
 
 
 # ── WEEKLY TEST ───────────────────────────────────────────────────────────────
@@ -277,6 +324,11 @@ def mcq_options(item, pool, field):
     ci = next(i for i, x in enumerate(opts) if x["id"] == item["id"])
     return [x[field] for x in opts], ci
 
+def both_meanings(word):
+    """English / Russian, but skip the slash when Russian is empty (custom words)."""
+    ru = word.get("meaning_ru", "")
+    return f"{word['meaning_en']} / {ru}" if ru else word["meaning_en"]
+
 def build_vocab_task(word_id, user, forced_type=None):
     word = next((w for w in HSK_WORDS if w["id"] == word_id), None)
     if not word: return {}
@@ -285,10 +337,12 @@ def build_vocab_task(word_id, user, forced_type=None):
 
     # Fix #2: no pinyin shown in production tasks
     if t == "recognition":
+        ru = word.get("meaning_ru", "")
+        alts = word.get("alt_en", []) + ([ru] if ru else [])
         return {"type":t,"word_id":word_id,
             "prompt":f"<b>{word['char']}</b>  [{word['pinyin']}]\n\nWhat does this mean?\nType in English or Russian",
-            "answer":word["meaning_en"],"alt_answers":word.get("alt_en",[]) + [word["meaning_ru"]],
-            "reveal":f"{word['char']} [{word['pinyin']}] - {word['meaning_en']} / {word['meaning_ru']}"}
+            "answer":word["meaning_en"],"alt_answers":alts,
+            "reveal":f"{word['char']} [{word['pinyin']}] - {both_meanings(word)}"}
 
     if t == "mcq_meaning":
         opts, ci = mcq_options(word, HSK_WORDS, "meaning_en")
@@ -405,21 +459,36 @@ def build_main_queue(user):
         if wid not in user["today_ids"]: user["today_ids"].append(wid)
         if wid not in user.get("week_ids",[]): user.setdefault("week_ids",[]).append(wid)
 
-    # New words from tomorrow's radical cluster if set, else general pool
+    # New words: tutor-added (custom) words come FIRST so lesson vocab
+    # enters review promptly, then the radical cluster, then general pool.
+    seen_set = set(user["vocab_seen"])
+    custom_pool = [w for w in HSK_WORDS if w["id"].startswith("c_") and w["id"] not in seen_set]
+    new_vocab = introduce_items(user["vocab_seen"], user["vocab_cards"], custom_pool,
+                                max(0, user["daily_new"] - user["new_today"]))
+    user["new_today"] += len(new_vocab)
+
+    # If an evening preview queued a radical-day, introduce that WHOLE day
+    # (the 5 anchors + their homophones you wrote in your notebook) as one unit.
     tmr_rad = user.get("tomorrow_radical_id")
     if tmr_rad:
-        _, cluster_words = get_radical_cluster(tmr_rad)
-        cluster_pool = [w for w in cluster_words if w["id"] not in set(user["vocab_seen"])]
-        new_vocab = introduce_items(user["vocab_seen"], user["vocab_cards"], cluster_pool, max(0, user["daily_new"] - user["new_today"]))
-        # Supplement with general pool if cluster exhausted
-        if len(new_vocab) < max(0, user["daily_new"] - user["new_today"]):
-            remaining = max(0, user["daily_new"] - user["new_today"] - len(new_vocab))
-            extra = introduce_items(user["vocab_seen"], user["vocab_cards"], HSK_WORDS, remaining)
-            new_vocab += extra
+        _, day_words = get_radical_cluster(tmr_rad)
+        day_pool = [w for w in day_words if w["id"] not in set(user["vocab_seen"])]
+        intro = introduce_items(user["vocab_seen"], user["vocab_cards"], day_pool, len(day_pool))
+        new_vocab += intro
+        user["new_today"] += len(intro)
+        # this day is now done; clear it so tomorrow's preview can set the next
+        user["tomorrow_radical_id"] = None
     else:
-        new_vocab = introduce_items(user["vocab_seen"], user["vocab_cards"], HSK_WORDS, max(0, user["daily_new"] - user["new_today"]))
+        # No queued day (e.g. first run before any evening preview): pull the
+        # next unstudied day so studying still works on demand.
+        nxt = pick_next_radical(user)
+        _, day_words = get_radical_cluster(nxt)
+        day_pool = [w for w in day_words if w["id"] not in set(user["vocab_seen"])]
+        if day_pool:
+            intro = introduce_items(user["vocab_seen"], user["vocab_cards"], day_pool, len(day_pool))
+            new_vocab += intro
+            user["new_today"] += len(intro)
 
-    user["new_today"] += len(new_vocab)
     for wid in new_vocab:
         queue.append({"kind":"vocab","id":wid,"forced_type":None})
         if wid not in user["today_ids"]: user["today_ids"].append(wid)
@@ -460,6 +529,8 @@ async def send_summary(context, chat_id, user, is_round=False, is_weektest=False
     bars = []
     for lv in range(1, 7):
         pool = [w for w in HSK_WORDS if w["hsk"] == lv]
+        if not pool:
+            continue
         done = sum(1 for w in pool if w["id"] in seen_vocab)
         pct = done / len(pool)
         bar = chr(9608)*round(pct*8) + chr(9617)*(8-round(pct*8))
@@ -702,11 +773,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Commands</b>\n"
         "/study - start today's session (+ today's grammar)\n"
         "/round - extra practice (new angle each time)\n"
+        "/add - add words from your tutor lesson\n"
         "/grammar - today's grammar point or a review\n"
         "/weektest - Sunday grand test\n"
         "/stats - your progress\n"
         "/settime 8 - morning reminder (UTC)\n"
-        "/seteveningtime 13 - evening preview time (UTC)\n"
+        "/seteveningtime 15 - evening preview time, UTC (15=10PM Thai)\n"
         "/pause and /resume - toggle reminders\n"
         "/done - end session early",
         parse_mode="HTML")
@@ -848,19 +920,25 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seen_rads = set(user["radical_seen"])
     known = sum(1 for c in user["vocab_cards"].values() if c.get("reps",0) >= 3)
     weak = len(get_weak_ids(user))
+    custom_total = sum(1 for w in HSK_WORDS if w["id"].startswith("c_"))
+    custom_seen = sum(1 for wid in seen_vocab if wid.startswith("c_"))
     lines = []
     for lv in range(1, 7):
         pool = [w for w in HSK_WORDS if w["hsk"] == lv]
+        if not pool:
+            continue
         done = sum(1 for w in pool if w["id"] in seen_vocab)
         pct = round(done/len(pool)*100)
         bar = chr(9608)*round(pct/10) + chr(9617)*(10-round(pct/10))
         lines.append(f"HSK {lv}: [{bar}] {pct}%  ({done}/{len(pool)})")
+    tutor_line = f"Tutor words: {custom_seen}/{custom_total} in review\n" if custom_total else ""
     await update.message.reply_text(
         f"<b>Your Progress</b>\n\n"
         f"Streak: {user['streak']} days\n"
         f"Vocab introduced: {len(seen_vocab)}/{len(HSK_WORDS)}\n"
         f"Vocab solid (3+ correct): {known}\n"
         f"Weak cards (3+ errors): {weak}\n"
+        f"{tutor_line}"
         f"Radicals seen: {len(seen_rads)}/50\n"
         f"Daily new target: {user['daily_new']}/day\n\n"
         + "\n".join(lines), parse_mode="HTML")
@@ -912,7 +990,91 @@ async def cmd_seteveningtime(update: Update, context: ContextTypes.DEFAULT_TYPE)
         save_data(data)
         await update.message.reply_text(f"Evening preview set to {h:02d}:00 UTC.\n(UTC+7: that's {(h+7)%24:02d}:00 local)")
     except:
-        await update.message.reply_text("Usage: /seteveningtime HH  e.g. /seteveningtime 13 (= 20:00 UTC+7)")
+        await update.message.reply_text("Usage: /seteveningtime HH  e.g. /seteveningtime 15 (= 22:00 / 10PM Thailand)")
+
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a tutor word: /add character, pinyin, meaning
+    The word becomes a normal review card mixed into daily sessions."""
+    raw = update.message.text
+    # strip the command itself, keep everything after /add
+    body = raw[len("/add"):].strip()
+    if not body:
+        await update.message.reply_text(
+            "Add a word from your lesson like this:\n\n"
+            "<b>/add 桌子, zhuōzi, table</b>\n\n"
+            "Format: character, pinyin, meaning (separated by commas).\n"
+            "You can add several at once, one per line:\n\n"
+            "/add 桌子, zhuōzi, table\n"
+            "椅子, yǐzi, chair\n"
+            "窗户, chuānghu, window\n\n"
+            "They'll mix into your normal reviews starting next /study.",
+            parse_mode="HTML")
+        return
+
+    data = load_data()
+    user = get_user(data, update.effective_user.id)
+
+    # Support multiple lines; first line had /add stripped already
+    lines = [body] + raw.split("\n")[1:]
+    added, promoted, failed = [], [], []
+    today = datetime.utcnow().date().isoformat()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        # accept Chinese comma 、／， or ASCII comma
+        parts = [p.strip() for p in line.replace("，", ",").replace("、", ",").split(",")]
+        parts = [p for p in parts if p]
+        if len(parts) < 3:
+            failed.append(line)
+            continue
+        char, pinyin, meaning = parts[0], parts[1], ", ".join(parts[2:])
+
+        # If the word already exists in the pool (e.g. it's an HSK word you
+        # haven't reached yet), PROMOTE it: pull it into active review now,
+        # regardless of its HSK level.
+        existing = next((w for w in HSK_WORDS if w["char"] == char), None)
+        if existing:
+            wid = existing["id"]
+            if wid not in set(user["vocab_seen"]):
+                user["vocab_seen"].append(wid)
+                user["vocab_cards"][wid] = {"ease": SM2_EASE_INIT, "interval": 0,
+                                            "reps": 0, "due": today}
+                promoted.append(f"{existing['char']} [{existing['pinyin']}] - {existing['meaning_en']} (HSK {existing['hsk']})")
+            else:
+                # already in your pile: just bring it forward for review today
+                if wid in user["vocab_cards"]:
+                    user["vocab_cards"][wid]["due"] = today
+                promoted.append(f"{existing['char']} [{existing['pinyin']}] - already learning, moved up")
+            continue
+
+        # Otherwise it's a brand-new word: add as a custom tutor word
+        word = {
+            "id": next_custom_id(), "hsk": 0, "char": char, "pinyin": pinyin,
+            "meaning_en": meaning, "meaning_ru": "",
+            "radical_id": "r46", "phonetic": None,
+            "homophones": [], "synonyms": [], "alt_en": [],
+            "notes": "Added from tutor lesson",
+        }
+        append_custom_word(word)
+        added.append(f"{char} [{pinyin}] - {meaning}")
+
+    save_data(data)
+
+    msg = ""
+    if added:
+        msg += f"<b>Added {len(added)} new word(s):</b>\n" + "\n".join(added)
+    if promoted:
+        if msg: msg += "\n\n"
+        msg += (f"<b>Pulled forward {len(promoted)} word(s) you'll learn now:</b>\n"
+                + "\n".join(promoted))
+    if added or promoted:
+        msg += ("\n\nThese enter your next /study session and flow into reviews, "
+                "weak-card tracking, and the weekly test.")
+    if failed:
+        msg += ("\n\n<b>Couldn't read:</b>\n" + "\n".join(failed) +
+                "\n\nUse: character, pinyin, meaning")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def cmd_grammar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
@@ -1014,13 +1176,14 @@ async def evening_preview(context: ContextTypes.DEFAULT_TYPE):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
+    load_custom_words()  # merge any tutor-added words into the pool
     app = Application.builder().token(BOT_TOKEN).build()
     for cmd, fn in [
         ("start", cmd_start), ("study", cmd_study), ("round", cmd_round),
         ("weektest", cmd_weektest), ("stats", cmd_stats), ("done", cmd_done),
         ("pause", cmd_pause), ("resume", cmd_resume),
         ("settime", cmd_settime), ("seteveningtime", cmd_seteveningtime),
-        ("grammar", cmd_grammar),
+        ("grammar", cmd_grammar), ("add", cmd_add),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(handle_callback))
